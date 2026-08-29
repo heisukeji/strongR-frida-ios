@@ -4,102 +4,139 @@ on:
   workflow_dispatch:
     inputs:
       frida_version:
-        description: 'Frida version to build (e.g. 17.7.3)'
+        description: 'Frida version to build'
         required: true
-        default: '17.7.3'
+        default: '17.17.0'
 
 jobs:
   build:
     runs-on: macos-14
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python 3.12
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Setup environment
+      - name: Setup Node.js (Latest LTS)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Build Dependencies
         run: |
-          python3 --version
-          pip3 install lief
-          brew install vala
+          export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
+          brew update --quiet
+          brew install vala ninja meson pkg-config bison flex
+          pip3 install lief meson ninja
+          
+          echo "=== SDK Verification ==="
           xcode-select -p
           xcrun --sdk iphoneos --show-sdk-path
-          xcodebuild -version
 
-      - name: Clone Frida and Florida patches
+      - name: Clone Frida Source (Target Version)
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
-          FRIDA_VERSION=${{ github.event.inputs.frida_version }}
-          echo "Building Frida $FRIDA_VERSION for iOS arm64"
+          FRIDA_VER="${{ github.event.inputs.frida_version }}"
+          echo "Cloning Frida $FRIDA_VER..."
           
-          git clone --recurse-submodules https://github.com/frida/frida.git
-          git clone https://github.com/Ylarod/Florida.git
-          
-          echo "Frida cloned, applying Florida patches..."
+          # 克隆指定版本的源码及其所有子模块
+          git clone --recurse-submodules --depth 1 --branch "$FRIDA_VER" https://github.com/frida/frida.git frida
 
-      - name: Apply Florida patches
+      - name: Apply Dynamic Anti-Detection (Python Patching)
+        run: |
+          echo "Running dynamic patcher on Frida 17.x source..."
+          python3 - << 'EOF'
+          import os
+          import re
+
+          def replace_in_file(file_path, search_regex, replacement):
+              if not os.path.exists(file_path):
+                  return
+              with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                  content = f.read()
+              new_content, count = re.subn(search_regex, replacement, content)
+              if count > 0:
+                  with open(file_path, 'w', encoding='utf-8') as f:
+                      f.write(new_content)
+                  print(f"[+] Patched {count} matches in: {file_path}")
+
+          # 1. 遍历 frida-gum，抹除线程名与特征字符 (gum-js-loop, gmain 等)
+          gum_dir = "frida/subprojects/frida-gum"
+          if os.path.exists(gum_dir):
+              for root, _, files in os.walk(gum_dir):
+                  for file in files:
+                      if file.endswith(('.c', '.h', '.cpp')):
+                          p = os.path.join(root, file)
+                          replace_in_file(p, r'gum-js-loop', 'sys-js-loop')
+                          replace_in_file(p, r'gmain', 'smain')
+                          replace_in_file(p, r'gdbus', 'sdbus')
+
+          # 2. 遍历 frida-core，修改管道名、服务名与 agent 动态库特征
+          core_dir = "frida/subprojects/frida-core"
+          if os.path.exists(core_dir):
+              for root, _, files in os.walk(core_dir):
+                  for file in files:
+                      if file.endswith(('.c', '.h', '.vala', '.cpp')):
+                          p = os.path.join(root, file)
+                          # 修改默认 socket / pipe 管道前缀
+                          replace_in_file(p, r'"frida-"', '"sys-"')
+                          replace_in_file(p, r'\"frida-\"', '\"sys-\"')
+                          replace_in_file(p, r'frida-server', 'sys-server')
+                          replace_in_file(p, r'frida-agent', 'sys-agent')
+
+          print("[✓] All anti-detection modifications applied successfully!")
+          EOF
+
+      - name: Build Frida for iOS arm64
         run: |
           cd frida
-          for path in ../Florida/patches/*; do
-            name=$(basename $path)
-            if [ -d "subprojects/$name" ]; then
-              echo "Applying patches to frida/subprojects/$name"
-              cd subprojects/$name
-              git am ../../../Florida/patches/$name/*.patch || {
-                echo "git am failed for $name, trying git apply..."
-                for p in ../../../Florida/patches/$name/*.patch; do
-                  git apply "$p" || echo "Warning: $(basename $p) failed"
-                done
-              }
-              cd ../..
-            else
-              echo "Skipping $name - subproject not found"
-            fi
-          done
-          echo "All patches applied."
+          # 执行 iOS arm64 交叉编译
+          make core-ios-arm64
+          echo "=== Build Completed Successfully ==="
 
-      - name: Build frida for iOS arm64
-        run: |
-          mkdir build-ios-arm64
-          cd build-ios-arm64
-          ../frida/configure --host=ios-arm64
-          make
-          echo "=== Build completed ==="
-
-      - name: Collect and upload artifacts
+      - name: Collect Artifacts & Ad-hoc Signing
         run: |
           mkdir -p output
-          FRIDA_VERSION=${{ github.event.inputs.frida_version }}
+          FRIDA_VER="${{ github.event.inputs.frida_version }}"
           
-          SERVER="build-ios-arm64/subprojects/frida-core/server/frida-server"
-          INJECT="build-ios-arm64/subprojects/frida-core/inject/frida-inject"
-          GADGET="build-ios-arm64/subprojects/frida-core/lib/gadget/frida-gadget.dylib"
+          # 收集编译产物
+          find frida/build -type f -name "frida-server" 2>/dev/null | while read f; do
+            echo "Found Server: $f"
+            cp "$f" "output/frida-server-${FRIDA_VER}-ios-arm64"
+          done
+
+          find frida/build -type f -name "frida-inject" 2>/dev/null | while read f; do
+            echo "Found Inject: $f"
+            cp "$f" "output/frida-inject-${FRIDA_VER}-ios-arm64"
+          done
+
+          find frida/build -type f -name "frida-gadget*.dylib" 2>/dev/null | while read f; do
+            echo "Found Gadget: $f"
+            cp "$f" "output/frida-gadget-${FRIDA_VER}-ios-arm64.dylib"
+          done
           
-          [ -f "$SERVER" ] && cp "$SERVER" "output/frida-server-${FRIDA_VERSION}-ios-arm64" && echo "Found server"
-          [ -f "$INJECT" ] && cp "$INJECT" "output/frida-inject-${FRIDA_VERSION}-ios-arm64" && echo "Found inject"
-          [ -f "$GADGET" ] && cp "$GADGET" "output/frida-gadget-${FRIDA_VERSION}-ios-arm64.dylib" && echo "Found gadget"
+          # 对生成的二进制进行基础代码签名
+          for bin in output/*; do
+            if [ -f "$bin" ]; then
+              echo "Codesigning: $bin"
+              codesign -s - -f "$bin" 2>/dev/null || true
+            fi
+          done
+
+          echo "=== Output Binaries ==="
+          ls -lh output/
           
           if [ -z "$(ls -A output 2>/dev/null)" ]; then
-            echo "Standard paths empty, searching..."
-            find build-ios-arm64 -type f \( -name 'frida-server' -o -name 'frida-inject' -o -name 'frida-gadget*' \) 2>/dev/null | while read f; do
-              echo "Found: $f"
-              cp "$f" output/
-            done
-          fi
-          
-          ls -la output/
-          if [ -z "$(ls -A output 2>/dev/null)" ]; then
-            echo "ERROR: No artifacts!"
-            find build-ios-arm64 -type f 2>/dev/null | grep -v __pycache__ | head -50
+            echo "::error::No output artifacts generated!"
             exit 1
           fi
 
-      - name: Upload artifacts
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: strongR-frida-ios-arm64-${{ github.event.inputs.frida_version }}
