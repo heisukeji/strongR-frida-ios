@@ -15,49 +15,52 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.11 (Frida Releng Standard)
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Install Build Dependencies & Setup Toolchain
+      - name: Setup Xcode & Build Toolchain
         run: |
           export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
           brew update --quiet
           brew install vala ninja meson pkg-config bison flex
-          pip3 install lief meson ninja
           
-          # 关键修复：将 Homebrew 的 keg-only bison 和 flex 强制注入 PATH
+          # 安装编译 Frida 构建系统必需的 Python 核心库
+          pip3 install setuptools wheel packaging jinja2 lief meson ninja
+          
+          # 注入 Homebrew 关键工具链到 PATH
           echo "/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
           echo "/opt/homebrew/opt/flex/bin" >> $GITHUB_PATH
           
-          echo "=== Verify Toolchain ==="
-          xcode-select -p
+          # 显式激活 Xcode 开发目录
+          sudo xcode-select -s /Applications/Xcode.app
+          echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> $GITHUB_ENV
+          
+          echo "=== Verify Xcode & SDK ==="
+          xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-path
-          /opt/homebrew/opt/bison/bin/bison --version
 
-      - name: Clone Frida Source
+      - name: Clone Frida Source (Target Version)
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
           FRIDA_VER="${{ github.event.inputs.frida_version }}"
-          echo "Cloning Frida $FRIDA_VER with submodules..."
+          echo "Cloning Frida $FRIDA_VER..."
           
-          # 克隆指定 tag 源码
           git clone --branch "$FRIDA_VER" https://github.com/frida/frida.git frida
           cd frida
-          # 完整同步递归子模块
           git submodule update --init --recursive --depth 1
 
       - name: Apply Safe Anti-Detection Patches
         run: |
-          echo "Applying safe regex replacements on Frida 17.x..."
+          echo "Applying anti-detection patches..."
           python3 - << 'EOF'
           import os
           import re
@@ -74,9 +77,9 @@ jobs:
                           f.write(new_content)
                       print(f"[+] Modified ({count} matches): {file_path}")
               except Exception as e:
-                  print(f"[-] Error patching {file_path}: {e}")
+                  print(f"[-] Error: {e}")
 
-          # 1. 消除 frida-gum 中的常驻特征线程名 (gum-js-loop, gmain 等)
+          # 1. 抹除 frida-gum 特征线程名 (gum-js-loop, gmain 等)
           gum_dir = "frida/subprojects/frida-gum"
           if os.path.exists(gum_dir):
               for root, _, files in os.walk(gum_dir):
@@ -87,34 +90,37 @@ jobs:
                           safe_replace(p, r'"gmain"', '"smain"')
                           safe_replace(p, r'"gdbus"', '"sdbus"')
 
-          # 2. 消除 frida-core 中的管道与默认 socket 特征名（精准替换字面量，不破坏 include）
+          # 2. 抹除 frida-core 中的管道与默认 socket 特征名
           core_dir = "frida/subprojects/frida-core"
           if os.path.exists(core_dir):
               for root, _, files in os.walk(core_dir):
                   for file in files:
                       if file.endswith(('.vala', '.c')):
                           p = os.path.join(root, file)
-                          # 修改 Unix Domain Socket 命名规则
                           safe_replace(p, r'"frida-"', '"sys-"')
                           safe_replace(p, r'\"frida-\"', '\"sys-\"')
                           safe_replace(p, r'"re.frida.server"', '"re.sys.server"')
 
-          print("[✓] Safe anti-detection patches completed.")
+          print("[✓] Anti-detection modifications applied successfully.")
           EOF
 
       - name: Build Frida for iOS arm64
         run: |
           cd frida
-          # 使用构建命令生成核心组件
-          make core-ios-arm64
-          echo "=== Build Finished ==="
+          # 执行编译，如果失败则自动打印详细的 Meson 错误日志
+          make core-ios-arm64 || {
+            echo "::error::Build failed, dumping Meson error log:"
+            find build -name "meson-log.txt" -exec tail -n 100 {} + 2>/dev/null || true
+            exit 1
+          }
+          echo "=== Build Finished Successfully ==="
 
       - name: Collect Artifacts & Ad-hoc Signing
         run: |
           mkdir -p output
           FRIDA_VER="${{ github.event.inputs.frida_version }}"
           
-          # 提取编译出来的二进制文件
+          # 收集生成的二进制文件
           find frida/build -type f -name "frida-server" 2>/dev/null | while read f; do
             echo "Found Server: $f"
             cp "$f" "output/frida-server-${FRIDA_VER}-ios-arm64"
@@ -130,7 +136,7 @@ jobs:
             cp "$f" "output/frida-gadget-${FRIDA_VER}-ios-arm64.dylib"
           done
           
-          # 自动 Ad-hoc 签名
+          # 自动 Ad-hoc 代码签名
           for bin in output/*; do
             if [ -f "$bin" ]; then
               echo "Codesigning: $bin"
@@ -142,7 +148,7 @@ jobs:
           ls -lh output/
           
           if [ -z "$(ls -A output 2>/dev/null)" ]; then
-            echo "::error::No output artifacts found!"
+            echo "::error::No artifacts found!"
             exit 1
           fi
 
