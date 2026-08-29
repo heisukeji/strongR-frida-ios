@@ -20,91 +20,101 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Setup Node.js (Latest LTS)
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
 
-      - name: Install Build Dependencies
+      - name: Install Build Dependencies & Setup Toolchain
         run: |
           export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
           brew update --quiet
           brew install vala ninja meson pkg-config bison flex
           pip3 install lief meson ninja
           
-          echo "=== SDK Verification ==="
+          # 关键修复：将 Homebrew 的 keg-only bison 和 flex 强制注入 PATH
+          echo "/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
+          echo "/opt/homebrew/opt/flex/bin" >> $GITHUB_PATH
+          
+          echo "=== Verify Toolchain ==="
           xcode-select -p
           xcrun --sdk iphoneos --show-sdk-path
+          /opt/homebrew/opt/bison/bin/bison --version
 
-      - name: Clone Frida Source (Target Version)
+      - name: Clone Frida Source
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
           
           FRIDA_VER="${{ github.event.inputs.frida_version }}"
-          echo "Cloning Frida $FRIDA_VER..."
+          echo "Cloning Frida $FRIDA_VER with submodules..."
           
-          # 克隆指定版本的源码及其所有子模块
-          git clone --recurse-submodules --depth 1 --branch "$FRIDA_VER" https://github.com/frida/frida.git frida
+          # 克隆指定 tag 源码
+          git clone --branch "$FRIDA_VER" https://github.com/frida/frida.git frida
+          cd frida
+          # 完整同步递归子模块
+          git submodule update --init --recursive --depth 1
 
-      - name: Apply Dynamic Anti-Detection (Python Patching)
+      - name: Apply Safe Anti-Detection Patches
         run: |
-          echo "Running dynamic patcher on Frida 17.x source..."
+          echo "Applying safe regex replacements on Frida 17.x..."
           python3 - << 'EOF'
           import os
           import re
 
-          def replace_in_file(file_path, search_regex, replacement):
-              if not os.path.exists(file_path):
+          def safe_replace(file_path, search_pattern, replacement):
+              if not os.path.isfile(file_path):
                   return
-              with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                  content = f.read()
-              new_content, count = re.subn(search_regex, replacement, content)
-              if count > 0:
-                  with open(file_path, 'w', encoding='utf-8') as f:
-                      f.write(new_content)
-                  print(f"[+] Patched {count} matches in: {file_path}")
+              try:
+                  with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                      content = f.read()
+                  new_content, count = re.subn(search_pattern, replacement, content)
+                  if count > 0:
+                      with open(file_path, 'w', encoding='utf-8') as f:
+                          f.write(new_content)
+                      print(f"[+] Modified ({count} matches): {file_path}")
+              except Exception as e:
+                  print(f"[-] Error patching {file_path}: {e}")
 
-          # 1. 遍历 frida-gum，抹除线程名与特征字符 (gum-js-loop, gmain 等)
+          # 1. 消除 frida-gum 中的常驻特征线程名 (gum-js-loop, gmain 等)
           gum_dir = "frida/subprojects/frida-gum"
           if os.path.exists(gum_dir):
               for root, _, files in os.walk(gum_dir):
                   for file in files:
-                      if file.endswith(('.c', '.h', '.cpp')):
+                      if file.endswith(('.c', '.h')):
                           p = os.path.join(root, file)
-                          replace_in_file(p, r'gum-js-loop', 'sys-js-loop')
-                          replace_in_file(p, r'gmain', 'smain')
-                          replace_in_file(p, r'gdbus', 'sdbus')
+                          safe_replace(p, r'"gum-js-loop"', '"sys-js-loop"')
+                          safe_replace(p, r'"gmain"', '"smain"')
+                          safe_replace(p, r'"gdbus"', '"sdbus"')
 
-          # 2. 遍历 frida-core，修改管道名、服务名与 agent 动态库特征
+          # 2. 消除 frida-core 中的管道与默认 socket 特征名（精准替换字面量，不破坏 include）
           core_dir = "frida/subprojects/frida-core"
           if os.path.exists(core_dir):
               for root, _, files in os.walk(core_dir):
                   for file in files:
-                      if file.endswith(('.c', '.h', '.vala', '.cpp')):
+                      if file.endswith(('.vala', '.c')):
                           p = os.path.join(root, file)
-                          # 修改默认 socket / pipe 管道前缀
-                          replace_in_file(p, r'"frida-"', '"sys-"')
-                          replace_in_file(p, r'\"frida-\"', '\"sys-\"')
-                          replace_in_file(p, r'frida-server', 'sys-server')
-                          replace_in_file(p, r'frida-agent', 'sys-agent')
+                          # 修改 Unix Domain Socket 命名规则
+                          safe_replace(p, r'"frida-"', '"sys-"')
+                          safe_replace(p, r'\"frida-\"', '\"sys-\"')
+                          safe_replace(p, r'"re.frida.server"', '"re.sys.server"')
 
-          print("[✓] All anti-detection modifications applied successfully!")
+          print("[✓] Safe anti-detection patches completed.")
           EOF
 
       - name: Build Frida for iOS arm64
         run: |
           cd frida
-          # 执行 iOS arm64 交叉编译
+          # 使用构建命令生成核心组件
           make core-ios-arm64
-          echo "=== Build Completed Successfully ==="
+          echo "=== Build Finished ==="
 
       - name: Collect Artifacts & Ad-hoc Signing
         run: |
           mkdir -p output
           FRIDA_VER="${{ github.event.inputs.frida_version }}"
           
-          # 收集编译产物
+          # 提取编译出来的二进制文件
           find frida/build -type f -name "frida-server" 2>/dev/null | while read f; do
             echo "Found Server: $f"
             cp "$f" "output/frida-server-${FRIDA_VER}-ios-arm64"
@@ -120,7 +130,7 @@ jobs:
             cp "$f" "output/frida-gadget-${FRIDA_VER}-ios-arm64.dylib"
           done
           
-          # 对生成的二进制进行基础代码签名
+          # 自动 Ad-hoc 签名
           for bin in output/*; do
             if [ -f "$bin" ]; then
               echo "Codesigning: $bin"
@@ -128,11 +138,11 @@ jobs:
             fi
           done
 
-          echo "=== Output Binaries ==="
+          echo "=== Artifacts Summary ==="
           ls -lh output/
           
           if [ -z "$(ls -A output 2>/dev/null)" ]; then
-            echo "::error::No output artifacts generated!"
+            echo "::error::No output artifacts found!"
             exit 1
           fi
 
