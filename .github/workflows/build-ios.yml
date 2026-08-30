@@ -29,7 +29,7 @@ jobs:
         run: |
           export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
           brew update --quiet
-          brew install vala ninja meson pkg-config bison flex
+          brew install vala ninja meson pkg-config bison flex dpkg ldid
           
           pip3 install setuptools wheel packaging jinja2 lief meson ninja
           
@@ -105,43 +105,127 @@ jobs:
           ninja -C build
           echo "=== Build Finished Successfully ==="
 
-      - name: Collect Artifacts & Ad-hoc Signing
+      - name: Package Rootless DEB & Sign Entitlements
         run: |
-          mkdir -p output
           FRIDA_VER="${{ github.event.inputs.frida_version }}"
-          
-          echo "Searching for compiled binaries..."
-          
-          find frida/build -type f -name "frida-server" 2>/dev/null | while read f; do
-            echo "Found Server: $f"
-            cp "$f" "output/frida-server-${FRIDA_VER}-ios-arm64"
-          done
+          mkdir -p output
+          mkdir -p deb_root/DEBIAN
+          mkdir -p deb_root/var/jb/usr/sbin
+          mkdir -p deb_root/var/jb/Library/LaunchDaemons
 
-          find frida/build -type f -name "frida-inject" 2>/dev/null | while read f; do
-            echo "Found Inject: $f"
-            cp "$f" "output/frida-inject-${FRIDA_VER}-ios-arm64"
-          done
+          # 1. 复制编译出的 server
+          SERVER_BIN=$(find frida/build -type f -name "frida-server" | head -n 1)
+          cp "$SERVER_BIN" deb_root/var/jb/usr/sbin/sys_helper
+          cp "$SERVER_BIN" "output/frida-server-${FRIDA_VER}-ios-arm64"
 
-          find frida/build -type f -name "frida-gadget*.dylib" 2>/dev/null | while read f; do
-            echo "Found Gadget: $f"
-            cp "$f" "output/frida-gadget-${FRIDA_VER}-ios-arm64.dylib"
-          done
-          
-          # 代码签名
-          for bin in output/*; do
-            if [ -f "$bin" ]; then
-              echo "Codesigning: $bin"
-              codesign -s - -f "$bin" 2>/dev/null || true
-            fi
-          done
+          # 收集 Gadget 和 Inject
+          find frida/build -type f -name "frida-gadget*.dylib" -exec cp {} output/frida-gadget-${FRIDA_VER}-ios-arm64.dylib \;
+          find frida/build -type f -name "frida-inject" -exec cp {} output/frida-inject-${FRIDA_VER}-ios-arm64 \;
 
-          echo "=== Artifacts Summary ==="
-          ls -lh output/
+          # 2. 写入完整的 iOS 调试与 FBS 启动特权并用 ldid 签署
+          cat << 'EOF' > /tmp/ent.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>get-task-allow</key>
+              <true/>
+              <key>task_for_pid-allow</key>
+              <true/>
+              <key>run-unsigned-code</key>
+              <true/>
+              <key>platform-application</key>
+              <true/>
+              <key>com.apple.system-task-ports</key>
+              <true/>
+              <key>com.apple.private.security.no-sandbox</key>
+              <true/>
+              <key>com.apple.frontboard.debugapplications</key>
+              <true/>
+              <key>com.apple.frontboard.launchapplications</key>
+              <true/>
+              <key>com.apple.springboard.debugapplications</key>
+              <true/>
+              <key>com.apple.springboard.launchapplications</key>
+              <true/>
+              <key>com.apple.backboardd.debugapplications</key>
+              <true/>
+              <key>com.apple.backboardd.launchapplications</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
           
-          if [ -z "$(ls -A output 2>/dev/null)" ]; then
-            echo "::error::No output artifacts found!"
-            exit 1
+          chmod 755 deb_root/var/jb/usr/sbin/sys_helper
+          ldid -S/tmp/ent.plist deb_root/var/jb/usr/sbin/sys_helper
+          ldid -S/tmp/ent.plist "output/frida-server-${FRIDA_VER}-ios-arm64"
+
+          # 3. 写入自启 LaunchDaemon Plist
+          cat << 'EOF' > deb_root/var/jb/Library/LaunchDaemons/re.frida.server.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>Label</key>
+              <string>re.frida.server</string>
+              <key>ProgramArguments</key>
+              <array>
+                  <string>/var/jb/usr/sbin/sys_helper</string>
+                  <string>-l</string>
+                  <string>0.0.0.0:19999</string>
+              </array>
+              <key>UserName</key>
+              <string>root</string>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>KeepAlive</key>
+              <true/>
+          </dict>
+          </plist>
+          EOF
+
+          # 4. 写入 Debian Control 元数据
+          cat << EOF > deb_root/DEBIAN/control
+          Package: re.sys.server
+          Name: Frida Core (Stealth Rootless)
+          Version: ${FRIDA_VER}
+          Architecture: iphoneos-arm64
+          Description: Modded Frida Server with anti-detection patches for Dopamine
+          Maintainer: heisukeji
+          Author: heisukeji
+          Section: Development
+          Priority: optional
+          EOF
+
+          # 5. 写入 postinst 与 prerm 生命周期脚本
+          cat << 'EOF' > deb_root/DEBIAN/postinst
+          #!/bin/sh
+          if [ "$1" = "configure" ] || [ "$1" = "upgrade" ]; then
+              chmod 755 /var/jb/usr/sbin/sys_helper
+              chown root:wheel /var/jb/usr/sbin/sys_helper
+              chown root:wheel /var/jb/Library/LaunchDaemons/re.frida.server.plist
+              launchctl unload /var/jb/Library/LaunchDaemons/re.frida.server.plist 2>/dev/null || true
+              launchctl load -w /var/jb/Library/LaunchDaemons/re.frida.server.plist 2>/dev/null || true
           fi
+          exit 0
+          EOF
+
+          cat << 'EOF' > deb_root/DEBIAN/prerm
+          #!/bin/sh
+          if [ "$1" = "remove" ] || [ "$1" = "purge" ] || [ "$1" = "upgrade" ]; then
+              launchctl unload /var/jb/Library/LaunchDaemons/re.frida.server.plist 2>/dev/null || true
+              killall -9 sys_helper 2>/dev/null || true
+          fi
+          exit 0
+          EOF
+
+          chmod 755 deb_root/DEBIAN/postinst deb_root/DEBIAN/prerm
+
+          # 6. 打包生成 DEB
+          DEB_NAME="re.sys.server_${FRIDA_VER}_iphoneos-arm64.deb"
+          dpkg-deb -b deb_root "output/${DEB_NAME}"
+          echo "=== Generated DEB Package: output/${DEB_NAME} ==="
+          ls -lh output/
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
