@@ -25,7 +25,7 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install Build Dependencies & Toolchain
+      - name: Install Build Dependencies & Setup Toolchain
         run: |
           export HOMEBREW_NO_REQUIRE_TAP_TRUST=1
           brew update --quiet
@@ -33,16 +33,13 @@ jobs:
           
           pip3 install setuptools wheel packaging jinja2 lief meson ninja
           
-          # 注入 Homebrew 关键工具链到 PATH
+          # 将 Homebrew 的 bison / flex 注入 PATH
           echo "/opt/homebrew/opt/bison/bin" >> $GITHUB_PATH
           echo "/opt/homebrew/opt/flex/bin" >> $GITHUB_PATH
           
-          # 显式激活 Xcode 开发环境
-          sudo xcode-select -s /Applications/Xcode.app
-          echo "DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer" >> $GITHUB_ENV
-          
-          echo "=== Verify Toolchain ==="
-          xcodebuild -version
+          # 自动接受 Xcode 许可并检查 iOS SDK
+          sudo xcodebuild -license accept
+          echo "=== Active SDK Path ==="
           xcrun --sdk iphoneos --show-sdk-path
 
       - name: Clone Frida Source (Target Version)
@@ -51,9 +48,9 @@ jobs:
           git config --global user.email "actions@github.com"
           
           FRIDA_VER="${{ github.event.inputs.frida_version }}"
-          echo "Cloning Frida $FRIDA_VER with all submodules..."
+          echo "Cloning Frida $FRIDA_VER..."
           
-          # 递归完整克隆
+          # 完整递归克隆指定版本
           git clone --recurse-submodules --branch "$FRIDA_VER" https://github.com/frida/frida.git frida
 
       - name: Apply Safe Anti-Detection Patches
@@ -105,12 +102,15 @@ jobs:
       - name: Build Frida for iOS arm64
         run: |
           cd frida
-          echo "Configuring Frida for iOS arm64..."
-          # 官方标准交叉编译配置
+          echo "=== Configuring for iOS arm64 ==="
           ./configure --host=ios-arm64
           
-          echo "Starting build..."
-          make
+          echo "=== Compiling Frida ==="
+          make || {
+            echo "::error::Build failed, dumping detailed Meson log:"
+            find . -name "meson-log.txt" -exec cat {} + 2>/dev/null || true
+            exit 1
+          }
           echo "=== Build Finished Successfully ==="
 
       - name: Collect Artifacts & Ad-hoc Signing
@@ -120,7 +120,7 @@ jobs:
           
           echo "Searching for compiled binaries..."
           
-          # 收集生成的二进制文件（不管是哪个子目录生成，递归精准抓取）
+          # 收集生成的二进制文件
           find frida/build -type f -name "frida-server" 2>/dev/null | while read f; do
             echo "Found Server: $f"
             cp "$f" "output/frida-server-${FRIDA_VER}-ios-arm64"
