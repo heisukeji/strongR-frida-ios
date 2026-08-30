@@ -37,6 +37,7 @@ jobs:
           echo "/opt/homebrew/opt/flex/bin" >> $GITHUB_PATH
           
           sudo xcodebuild -license accept
+          echo "IOS_CERTID=-" >> $GITHUB_ENV
           echo "=== Active SDK Path ==="
           xcrun --sdk iphoneos --show-sdk-path
 
@@ -95,6 +96,7 @@ jobs:
 
       - name: Build Frida for iOS arm64
         run: |
+          export IOS_CERTID="-"
           cd frida
           echo "=== 1. Configuring Meson for iOS arm64 ==="
           ./configure --host=ios-arm64
